@@ -31,14 +31,6 @@ export interface PendingTwoFactorState {
   confirmationResult: ConfirmationResult | null;
 }
 
-interface LocalAccount {
-  uid: string;
-  email: string;
-  displayName: string;
-  phone?: string;
-  passwordHash: string;
-  createdAt: number;
-}
 
 interface AuthContextType {
   user: AuthUser | null;
@@ -86,7 +78,6 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 const CURRENT_USER_SESSION_KEY = 'riwaaj_active_user_session';
 const ACCOUNTS_REGISTRY_KEY = 'riwaaj_registered_accounts_registry';
-const PHONE_LOOKUP_MAP_KEY = 'riwaaj_phone_to_email_map';
 const TWO_FACTOR_CONFIG_PREFIX = 'riwaaj_2fa_config_';
 
 /**
@@ -120,54 +111,14 @@ export function maskPhoneNumber(phone: string): string {
   return `${start} ••••• ••${last4}`;
 }
 
-export function getLocalPhoneMap(): Record<string, string> {
-  if (typeof window === 'undefined') return {};
-  try {
-    const raw = localStorage.getItem(PHONE_LOOKUP_MAP_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
-}
-
-export function saveLocalPhoneMapping(phone: string, email: string) {
-  if (typeof window === 'undefined' || !phone || !email) return;
-  const map = getLocalPhoneMap();
-  const rawPhone = phone.trim();
-  const normalized = normalizePhoneNumber(rawPhone);
-  const cleanEmail = email.trim().toLowerCase();
-
-  map[rawPhone] = cleanEmail;
-  map[normalized] = cleanEmail;
-  if (normalized.startsWith('+')) {
-    map[normalized.slice(1)] = cleanEmail;
-  }
-  localStorage.setItem(PHONE_LOOKUP_MAP_KEY, JSON.stringify(map));
-}
-
 /**
- * Resolves a phone number to its corresponding registered account email.
- * First checks the device's local registry, then attempts to query the backend route.
+ * Resolves a phone number to its corresponding registered account email via the backend API route.
+ * Does not store, encrypt, or look up a persistent phone-to-email directory in client localStorage.
  */
 export async function resolvePhoneToEmail(phone: string): Promise<string | null> {
   const rawPhone = phone.trim();
-  const normalized = normalizePhoneNumber(rawPhone);
+  if (!rawPhone) return null;
 
-  // 1. Check local registry on this device
-  const map = getLocalPhoneMap();
-  if (map[rawPhone]) return map[rawPhone];
-  if (map[normalized]) return map[normalized];
-  if (normalized.startsWith('+') && map[normalized.slice(1)]) {
-    return map[normalized.slice(1)];
-  }
-  const last10 = normalized.slice(-10);
-  if (last10.length === 10) {
-    for (const [key, email] of Object.entries(map)) {
-      if (key.endsWith(last10)) return email;
-    }
-  }
-
-  // 2. Query backend API route if running
   try {
     const res = await fetch('/api/auth/resolve-phone', {
       method: 'POST',
@@ -176,7 +127,6 @@ export async function resolvePhoneToEmail(phone: string): Promise<string | null>
     });
     const data = await res.json();
     if (res.ok && data?.email) {
-      saveLocalPhoneMapping(rawPhone, data.email);
       return data.email;
     }
     if (data?.error === 'PHONE_LOOKUP_REQUIRES_ADMIN') {
@@ -216,28 +166,6 @@ function save2FAConfig(uid: string, enabled: boolean, phone: string) {
   }
 }
 
-function getLocalAccounts(): LocalAccount[] {
-  if (typeof window === 'undefined') return [];
-  const raw = localStorage.getItem(ACCOUNTS_REGISTRY_KEY);
-  if (!raw) return [];
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return [];
-  }
-}
-
-function saveLocalAccount(account: LocalAccount) {
-  if (typeof window === 'undefined') return;
-  const accounts = getLocalAccounts();
-  const existingIdx = accounts.findIndex((a) => a.email.toLowerCase() === account.email.toLowerCase());
-  if (existingIdx !== -1) {
-    accounts[existingIdx] = account;
-  } else {
-    accounts.push(account);
-  }
-  localStorage.setItem(ACCOUNTS_REGISTRY_KEY, JSON.stringify(accounts));
-}
 
 /**
  * Translate Firebase Authentication error codes into clear, actionable messages
@@ -323,20 +251,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [pendingTwoFactor, setPendingTwoFactor] = useState<PendingTwoFactorState | null>(null);
 
   useEffect(() => {
+    // Proactively purge any legacy insecure account registry or phone map keys
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.removeItem(ACCOUNTS_REGISTRY_KEY);
+        localStorage.removeItem('riwaaj_phone_to_email_map');
+      } catch {}
+    }
+
     // 1. Check if Firebase Auth is initialized and has an active session
     if (isFirebaseConfigured && auth) {
       const unsubscribe = onAuthStateChanged(auth, (firebaseUser: User | null) => {
         if (firebaseUser) {
           const twoFactorConfig = getStored2FAConfig(firebaseUser.uid);
           let userPhone = firebaseUser.phoneNumber;
-          if (!userPhone && firebaseUser.email) {
-            const map = getLocalPhoneMap();
-            for (const [p, em] of Object.entries(map)) {
-              if (em.toLowerCase() === firebaseUser.email.toLowerCase()) {
-                userPhone = p;
-                break;
+          if (!userPhone) {
+            try {
+              const stored = localStorage.getItem(CURRENT_USER_SESSION_KEY);
+              if (stored) {
+                const parsed: AuthUser = JSON.parse(stored);
+                if (parsed?.uid === firebaseUser.uid && parsed?.phoneNumber) {
+                  userPhone = parsed.phoneNumber;
+                }
               }
-            }
+            } catch {}
           }
           const authUser: AuthUser = {
             uid: firebaseUser.uid,
@@ -374,14 +312,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
       return () => unsubscribe();
     } else {
-      // Offline / Local session checking
+      // Offline / unconfigured environment: Only restore explicit demo sessions
       const stored = localStorage.getItem(CURRENT_USER_SESSION_KEY);
       if (stored) {
         try {
-          setUser(JSON.parse(stored));
+          const parsed: AuthUser = JSON.parse(stored);
+          if (parsed?.isDemoUser) {
+            setUser(parsed);
+          } else {
+            localStorage.removeItem(CURRENT_USER_SESSION_KEY);
+            setUser(null);
+          }
         } catch {
+          localStorage.removeItem(CURRENT_USER_SESSION_KEY);
           setUser(null);
         }
+      } else {
+        setUser(null);
       }
       setLoading(false);
     }
@@ -426,14 +373,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const cred = await signInWithEmailAndPassword(auth, targetEmail, pass);
         if (cred.user) {
           const twoFactorConfig = getStored2FAConfig(cred.user.uid);
-          const map = getLocalPhoneMap();
           let userPhone = cred.user.phoneNumber;
           if (!userPhone) {
-            for (const [p, em] of Object.entries(map)) {
-              if (em.toLowerCase() === targetEmail.toLowerCase()) {
-                userPhone = p;
-                break;
-              }
+            if (!cleanId.includes('@')) {
+              userPhone = cleanId;
+            } else {
+              try {
+                const stored = localStorage.getItem(CURRENT_USER_SESSION_KEY);
+                if (stored) {
+                  const parsed: AuthUser = JSON.parse(stored);
+                  if (parsed?.uid === cred.user.uid && parsed?.phoneNumber) {
+                    userPhone = parsed.phoneNumber;
+                  }
+                }
+              } catch {}
             }
           }
 
@@ -471,44 +424,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    // Offline / unconfigured fallback
-    const localAccounts = getLocalAccounts();
-    const localAcc = localAccounts.find(
-      (a) =>
-        a.email.toLowerCase() === targetEmail.toLowerCase() ||
-        a.phone === cleanId ||
-        normalizePhoneNumber(a.phone || '') === normalizePhoneNumber(cleanId)
+    throw new Error(
+      'Authentication service is unavailable or not configured. Please ensure Firebase configuration in .env.local is present, or explore the Sandbox Demo.'
     );
-    if (localAcc) {
-      if (localAcc.passwordHash !== pass) {
-        throw new Error('Invalid email/phone or password. Please verify credentials.');
-      }
-      const twoFactorConfig = getStored2FAConfig(localAcc.uid);
-      const authUser: AuthUser = {
-        uid: localAcc.uid,
-        email: localAcc.email,
-        displayName: localAcc.displayName,
-        phoneNumber: localAcc.phone || null,
-        emailVerified: true,
-        isDemoUser: false,
-        isTwoFactorEnabled: Boolean(twoFactorConfig?.enabled),
-        twoFactorPhoneNumber: twoFactorConfig?.phone || null,
-      };
-
-      if (twoFactorConfig?.enabled && twoFactorConfig.phone) {
-        setPendingTwoFactor({
-          user: authUser,
-          phoneHint: maskPhoneNumber(twoFactorConfig.phone),
-          confirmationResult: null,
-        });
-        return { requires2FA: true };
-      }
-
-      setUser(authUser);
-      localStorage.setItem(CURRENT_USER_SESSION_KEY, JSON.stringify(authUser));
-      return { requires2FA: false };
-    }
-    throw new Error('No registered account found with these credentials. Please check or sign up.');
   };
 
   /**
@@ -545,18 +463,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       throw new Error('Password must be at least 6 characters.');
     }
 
-    // Check duplicate phone mapping locally
-    const phoneMap = getLocalPhoneMap();
-    const normalizedPhone = normalizePhoneNumber(cleanPhone);
-    const existingEmailForPhone =
-      phoneMap[cleanPhone] ||
-      phoneMap[normalizedPhone] ||
-      (normalizedPhone.startsWith('+') ? phoneMap[normalizedPhone.slice(1)] : undefined);
-
-    if (existingEmailForPhone && existingEmailForPhone.toLowerCase() !== cleanEmail) {
-      throw new Error(
-        `This phone number is already registered with account "${existingEmailForPhone}". Please log in instead.`
-      );
+    // Check if phone number is already registered via backend resolver
+    try {
+      const existingEmail = await resolvePhoneToEmail(cleanPhone);
+      if (existingEmail && existingEmail.toLowerCase() !== cleanEmail) {
+        throw new Error(
+          'This phone number is already registered with an existing account. Please log in instead.'
+        );
+      }
+    } catch (checkErr: any) {
+      if (checkErr?.message?.includes('already registered with an existing account')) {
+        throw checkErr;
+      }
+      // Non-blocking if cross-device resolver is unconfigured
     }
 
     if (isFirebaseConfigured && auth) {
@@ -591,8 +510,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             }
           }
 
-          // Register phone-to-email mapping for password login
-          saveLocalPhoneMapping(cleanPhone, cleanEmail);
 
           const authUser: AuthUser = {
             uid: cred.user.uid,
@@ -617,30 +534,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    // Offline / unconfigured fallback
-    const randomUid = `local_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
-    saveLocalAccount({
-      uid: randomUid,
-      email: cleanEmail,
-      displayName: cleanName,
-      phone: cleanPhone,
-      passwordHash: pass,
-      createdAt: Date.now(),
-    });
-
-    saveLocalPhoneMapping(cleanPhone, cleanEmail);
-
-    const authUser: AuthUser = {
-      uid: randomUid,
-      email: cleanEmail,
-      displayName: cleanName,
-      phoneNumber: cleanPhone,
-      emailVerified: true,
-      isDemoUser: false,
-      isTwoFactorEnabled: false,
-    };
-    setUser(authUser);
-    localStorage.setItem(CURRENT_USER_SESSION_KEY, JSON.stringify(authUser));
+    throw new Error(
+      'Account registration requires active Firebase Authentication. Please configure Firebase credentials in .env.local or explore the Sandbox Demo.'
+    );
   };
 
   /**
@@ -674,11 +570,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         throw customError;
       }
     }
-    const localAccounts = getLocalAccounts();
-    const localAcc = localAccounts.find((a) => a.email.toLowerCase() === cleanEmail);
-    if (!localAcc) {
-      throw new Error('No registered account found with this email.');
-    }
+    throw new Error(
+      'Password reset is unavailable because Firebase Authentication is not configured.'
+    );
   };
 
   const verifyTwoFactorLogin = async (code: string): Promise<void> => {
@@ -813,6 +707,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const logOut = async () => {
     const currentUid = user?.uid;
     localStorage.removeItem(CURRENT_USER_SESSION_KEY);
+    localStorage.removeItem('riwaaj_phone_to_email_map');
+    localStorage.removeItem(ACCOUNTS_REGISTRY_KEY);
     setPendingTwoFactor(null);
 
     if (typeof window !== 'undefined') {
@@ -824,6 +720,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             k &&
             (k.startsWith('riwaaj_people_') ||
               k.startsWith('riwaaj_transactions_') ||
+              k === 'riwaaj_phone_to_email_map' ||
+              k === ACCOUNTS_REGISTRY_KEY ||
               (currentUid && k.includes(currentUid)))
           ) {
             keysToRemove.push(k);

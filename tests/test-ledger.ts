@@ -557,7 +557,13 @@ testTimeoutBehavior().then(() => {
   // TEST 18: TWO-STEP VERIFICATION (2FA) & PHONE MASKING
   // ==========================================
   console.log('Checking Test 18: Two-Step Verification helpers & phone masking...');
-  import('../src/lib/auth-context').then(({ maskPhoneNumber, normalizePhoneNumber, isValidPhoneNumber, isValidEmail }) => {
+  import('../src/lib/auth-context').then(async ({
+    maskPhoneNumber,
+    normalizePhoneNumber,
+    isValidPhoneNumber,
+    isValidEmail,
+    resolvePhoneToEmail,
+  }) => {
     const masked1 = maskPhoneNumber('+919419012345');
     assert.ok(masked1.includes('2345'), 'Masked phone should display last 4 digits');
     assert.ok(masked1.startsWith('+91'), 'Masked phone should preserve country code');
@@ -665,6 +671,151 @@ testTimeoutBehavior().then(() => {
     assert.ok(loginPageContent.includes('<PrivacyTrustNote />'), 'LoginPage must render PrivacyTrustNote on signup');
 
     console.log('✓ Test 22 PASSED: Developer Credit and Privacy Trust Note accurately verified.\n');
+
+    // ==========================================
+    // TEST 23: SECURITY AUDIT FIXES: NO PLAINTEXT PASSWORDS & COMPLETE REMOVAL OF CLIENT-SIDE PHONE DIRECTORY
+    // ==========================================
+    console.log('Checking Test 23: Security fixes for plaintext passwords & complete removal of client-side phone directory...');
+
+    const authContextSource = fs.readFileSync(path.resolve(__dirname, '../src/lib/auth-context.tsx'), 'utf-8');
+
+    // 1. Insecure Local Account Fallback completely removed
+    assert.strictEqual(
+      authContextSource.includes('passwordHash'),
+      false,
+      'auth-context.tsx must not contain any passwordHash storage or retrieval'
+    );
+    assert.strictEqual(
+      authContextSource.includes('saveLocalAccount'),
+      false,
+      'auth-context.tsx must not define or call saveLocalAccount'
+    );
+    assert.strictEqual(
+      authContextSource.includes('interface LocalAccount'),
+      false,
+      'auth-context.tsx must not define LocalAccount interface'
+    );
+
+    // 2. Duplicate phone signup error message must NOT leak email
+    assert.strictEqual(
+      authContextSource.includes('${existingEmailForPhone}'),
+      false,
+      'Duplicate phone signup must not leak the registered email address in error messages'
+    );
+
+    // 3. Complete removal of client-side phone-to-email mapping directory
+    assert.strictEqual(
+      authContextSource.includes('saveLocalPhoneMapping'),
+      false,
+      'auth-context.tsx must not define or call saveLocalPhoneMapping'
+    );
+    assert.strictEqual(
+      authContextSource.includes('getLocalPhoneMap'),
+      false,
+      'auth-context.tsx must not define or call getLocalPhoneMap'
+    );
+    assert.strictEqual(
+      authContextSource.includes('resolveLocalEmailByPhone'),
+      false,
+      'auth-context.tsx must not define or call resolveLocalEmailByPhone'
+    );
+    assert.strictEqual(
+      authContextSource.includes('PHONE_LOOKUP_MAP_KEY'),
+      false,
+      'auth-context.tsx must not define PHONE_LOOKUP_MAP_KEY'
+    );
+    assert.strictEqual(
+      authContextSource.includes('cipherEmail'),
+      false,
+      'auth-context.tsx must not define cipherEmail'
+    );
+    assert.strictEqual(
+      authContextSource.includes('decipherEmail'),
+      false,
+      'auth-context.tsx must not define decipherEmail'
+    );
+    assert.strictEqual(
+      authContextSource.includes('sha256Hex'),
+      false,
+      'auth-context.tsx must not define sha256Hex'
+    );
+
+    // Verify localStorage NEVER writes or reads riwaaj_phone_to_email_map
+    assert.strictEqual(
+      authContextSource.includes("localStorage.setItem('riwaaj_phone_to_email_map'"),
+      false,
+      'auth-context.tsx must never write riwaaj_phone_to_email_map to localStorage'
+    );
+    assert.strictEqual(
+      authContextSource.includes("localStorage.getItem('riwaaj_phone_to_email_map')"),
+      false,
+      'auth-context.tsx must never read riwaaj_phone_to_email_map from localStorage'
+    );
+
+    // 4. Verify resolvePhoneToEmail operates via backend API without localStorage dependency
+    const mockStorage: Record<string, string> = {};
+    (global as any).localStorage = {
+      getItem: (k: string) => mockStorage[k] || null,
+      setItem: (k: string, v: string) => { mockStorage[k] = v; },
+      removeItem: (k: string) => { delete mockStorage[k]; },
+      get length() { return Object.keys(mockStorage).length; },
+      key: (i: number) => Object.keys(mockStorage)[i] || null,
+    };
+    (global as any).window = {};
+
+    // Mock fetch to simulate backend responses
+    const originalFetch = (global as any).fetch;
+    try {
+      // Test 4a: Backend successfully resolves email
+      (global as any).fetch = async (url: string, opts: any) => {
+        assert.strictEqual(url, '/api/auth/resolve-phone');
+        const payload = JSON.parse(opts.body);
+        assert.strictEqual(payload.phone, '+919419012345');
+        return {
+          ok: true,
+          json: async () => ({ email: 'faizan@example.com' }),
+        };
+      };
+
+      const resolved = await resolvePhoneToEmail('+919419012345');
+      assert.strictEqual(resolved, 'faizan@example.com', 'resolvePhoneToEmail should resolve email via backend');
+      assert.strictEqual(mockStorage['riwaaj_phone_to_email_map'], undefined, 'No client-side phone mapping written to localStorage');
+
+      // Test 4b: Backend without admin credentials returns PHONE_LOOKUP_REQUIRES_ADMIN
+      (global as any).fetch = async () => ({
+        ok: false,
+        json: async () => ({
+          error: 'PHONE_LOOKUP_REQUIRES_ADMIN',
+          message: 'Cross-device phone lookup requires Firebase Admin credentials on the backend.',
+        }),
+      });
+
+      let adminRequiredErrorThrown = false;
+      try {
+        await resolvePhoneToEmail('+919419099999');
+      } catch (e: any) {
+        adminRequiredErrorThrown = true;
+        assert.strictEqual(e.code, 'auth/phone-lookup-admin-required');
+        assert.ok(e.message.includes('requires signing in with your registered Email address and Password'));
+      }
+      assert.strictEqual(adminRequiredErrorThrown, true, 'Must throw helpful error advising email login when Admin is unconfigured');
+
+      // Test 4c: Non-existent phone returns null
+      (global as any).fetch = async () => ({
+        ok: false,
+        json: async () => ({
+          error: 'USER_NOT_FOUND',
+          message: 'No registered account found with this phone number.',
+        }),
+      });
+
+      const notFoundResolved = await resolvePhoneToEmail('+919999999999');
+      assert.strictEqual(notFoundResolved, null, 'Must return null when phone is not registered');
+    } finally {
+      (global as any).fetch = originalFetch;
+    }
+
+    console.log('✓ Test 23 PASSED: Plaintext passwords removed, client-side phone directory completely eliminated, and backend resolution verified.\n');
 
     console.log('==============================================');
     console.log('ALL VERIFICATION UNIT TESTS PASSED SUCCESSFULLY');
