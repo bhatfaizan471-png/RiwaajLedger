@@ -1,0 +1,187 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Application: Riwaaj Ledger (Kashmiri Wedding & Gift Khatabandi)
+// Security Model: Multi-tenant, strictly user-isolated.
+//
+// 1. Collection: /users/{userId}
+//    - Represents the authenticated user's root scope.
+//    - Accessible ONLY by the user matching request.auth.uid.
+//
+// 2. Collection: /users/{userId}/people/{personId}
+//    - Stores individual contacts/family records.
+//    - Fields:
+//      * id: string (non-empty, max 64 chars) - unique person ID
+//      * userId: string (matches request.auth.uid) - owner UID
+//      * fullName: string (1-150 chars) - contact name
+//      * normalizedName: string (1-150 chars) - lowercase searchable name
+//      * parentageRelation: string ('S/o' | 'D/o' | 'W/o' | 'H/o')
+//      * parentageName: string (1-150 chars) - parent/spouse name
+//      * mohalla: string (1-150 chars) - locality/address
+//      * phone: string (0-30 chars) - contact phone number
+//      * relationship: string (0-100 chars) - family relation
+//      * notes: string (0-1000 chars) - reference notes
+//      * createdAt: timestamp/number - creation timestamp
+//      * updatedAt: timestamp/number - last updated timestamp
+//
+// 3. Collection: /users/{userId}/people/{personId}/transactions/{transactionId}
+//    - Stores gift, cash, and occasion entries for a contact.
+//    - Fields:
+//      * id: string (non-empty, max 64 chars) - transaction ID
+//      * personId: string (matches parent personId)
+//      * userId: string (matches request.auth.uid)
+//      * date: string (format: YYYY-MM-DD, e.g. 2025-01-15)
+//      * occasion: string (1-200 chars) - occasion/gift name
+//      * direction: string ('CREDIT' | 'DEBIT')
+//      * giftType: string ('CASH' | 'TOFFEE_PACKET' | 'BADAM_ALMONDS' | 'DRY_FRUITS' | 'HOUSEHOLD_GIFT' | 'OTHER')
+//      * amountInPaise: number (>= 0) - integer paise (0 for non-cash)
+//      * quantity: number (>= 0) - quantity of gifts
+//      * unit: string (0-50 chars) - packet, box, etc.
+//      * description: string (0-500 chars) - item details
+//      * notes: string (0-1000 chars) - transaction notes
+//      * createdAt: timestamp/number - creation timestamp
+//      * updatedAt: timestamp/number - last updated timestamp
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if the user is authenticated with Firebase Auth
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    // Enforce strict ownership: user can only access their own root tree
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Validate allowed keys
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // Validate required keys exist
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Verify immutable fields are not modified on update
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Validate timestamp or numerical epoch
+    function isValidTimeField(val) {
+      return val is timestamp || val is number;
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    // Validator for Person documents
+    function isValidPerson(data, userId) {
+      let allowedFields = [
+        'id', 'userId', 'fullName', 'normalizedName',
+        'parentageRelation', 'parentageName', 'mohalla',
+        'phone', 'relationship', 'notes', 'createdAt', 'updatedAt',
+        'isDeleted', 'deletedAt'
+      ];
+
+      return hasOnlyAllowedFields(allowedFields) &&
+             hasRequiredFields(['id', 'userId', 'fullName', 'normalizedName', 'parentageName', 'mohalla']) &&
+             data.id is string && data.id.size() > 0 && data.id.size() <= 64 &&
+             data.userId == userId && data.userId == request.auth.uid &&
+             data.fullName is string && data.fullName.size() > 0 && data.fullName.size() <= 150 &&
+             data.normalizedName is string && data.normalizedName.size() > 0 && data.normalizedName.size() <= 150 &&
+             data.parentageRelation in ['S/o', 'D/o', 'W/o', 'H/o'] &&
+             data.parentageName is string && data.parentageName.size() > 0 && data.parentageName.size() <= 150 &&
+             data.mohalla is string && data.mohalla.size() > 0 && data.mohalla.size() <= 150 &&
+             data.phone is string && data.phone.size() <= 30 &&
+             data.relationship is string && data.relationship.size() <= 100 &&
+             data.notes is string && data.notes.size() <= 1000 &&
+             (!('isDeleted' in data) || data.isDeleted is bool) &&
+             (!('deletedAt' in data) || data.deletedAt == null || isValidTimeField(data.deletedAt)) &&
+             isValidTimeField(data.createdAt) &&
+             isValidTimeField(data.updatedAt);
+    }
+
+    // Validator for Transaction documents
+    function isValidTransaction(data, userId, personId) {
+      let allowedFields = [
+        'id', 'personId', 'userId', 'date', 'occasion',
+        'direction', 'giftType', 'amountInPaise', 'quantity',
+        'unit', 'description', 'notes', 'createdAt', 'updatedAt',
+        'isDeleted', 'deletedAt'
+      ];
+
+      let validGiftTypes = [
+        'CASH', 'TOFFEE_PACKET', 'BADAM_ALMONDS',
+        'DRY_FRUITS', 'HOUSEHOLD_GIFT', 'OTHER'
+      ];
+
+      return hasOnlyAllowedFields(allowedFields) &&
+             hasRequiredFields(['id', 'personId', 'userId', 'date', 'occasion', 'direction', 'giftType']) &&
+             data.id is string && data.id.size() > 0 && data.id.size() <= 64 &&
+             data.personId == personId &&
+             data.userId == userId && data.userId == request.auth.uid &&
+             data.date is string && data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+             data.occasion is string && data.occasion.size() > 0 && data.occasion.size() <= 200 &&
+             data.direction in ['CREDIT', 'DEBIT'] &&
+             data.giftType in validGiftTypes &&
+             data.amountInPaise is number && data.amountInPaise >= 0 &&
+             data.quantity is number && data.quantity >= 0 &&
+             data.unit is string && data.unit.size() <= 50 &&
+             data.description is string && data.description.size() <= 500 &&
+             data.notes is string && data.notes.size() <= 1000 &&
+             (!('isDeleted' in data) || data.isDeleted is bool) &&
+             (!('deletedAt' in data) || data.deletedAt == null || isValidTimeField(data.deletedAt)) &&
+             isValidTimeField(data.createdAt) &&
+             isValidTimeField(data.updatedAt);
+    }
+
+    // ===============================================================
+    // Rules Definition
+    // ===============================================================
+
+    // Match root user scope: /users/{userId}
+    match /users/{userId} {
+      // User can read and write their own profile document
+      allow read, write: if isOwner(userId);
+
+      // People collection: /users/{userId}/people/{personId}
+      match /people/{personId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidPerson(request.resource.data, userId);
+        allow update: if isOwner(userId) &&
+                         isValidPerson(request.resource.data, userId) &&
+                         areImmutableFieldsUnchanged(['id', 'userId', 'createdAt']);
+        allow delete: if isOwner(userId);
+
+        // Transactions subcollection: /users/{userId}/people/{personId}/transactions/{transactionId}
+        match /transactions/{transactionId} {
+          allow read: if isOwner(userId);
+          allow create: if isOwner(userId) && isValidTransaction(request.resource.data, userId, personId);
+          allow update: if isOwner(userId) &&
+                           isValidTransaction(request.resource.data, userId, personId) &&
+                           areImmutableFieldsUnchanged(['id', 'personId', 'userId', 'createdAt']);
+          allow delete: if isOwner(userId);
+        }
+      }
+    }
+
+    // Default deny for all other paths and root queries
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
